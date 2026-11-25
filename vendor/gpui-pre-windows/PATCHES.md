@@ -17,3 +17,10 @@ right-to-left text (Arabic, Hebrew, ...) was drawn mirrored.
 
 Every change is marked with "Stream Tube patch". Drop this folder and the
 `[patch.crates-io]` entry in `Cargo.toml` once upstream handles bidi text.
+
+## Windows 1080p video texture pooling (`src/directx_atlas.rs`)
+
+- Large single-tile textures (`width > 1024 || height > 1024`, such as 720p/1080p
+  video frames) are created as `D3D11_USAGE_DYNAMIC` with `D3D11_CPU_ACCESS_WRITE`,
+  uploaded via `Map(D3D11_MAP_WRITE_DISCARD)`, and pooled (up to 4 textures) on
+  `remove()` instead of destroying and recreating `ID3D11Texture2D` every frame.

@@ -1,5 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod alloc_cache;
 mod api;
+
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static GLOBAL: alloc_cache::LargeBufferAllocator = alloc_cache::LargeBufferAllocator;
 mod assets;
 mod display;
 mod perf;

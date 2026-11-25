@@ -2,7 +2,8 @@ use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
     Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE_DISCARD,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
         ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
     },
     Dxgi::Common::*,
@@ -13,6 +14,22 @@ use gpui::{
     AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
 };
 
+// Stream Tube patch: keep up to this many unreferenced large single-image textures
+// (such as 1080p video frames) in a pool and update them via D3D11_USAGE_DYNAMIC +
+// Map(WRITE_DISCARD) instead of creating/destroying ID3D11Texture2D resources on
+// every video frame.
+const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(1024),
+    height: DevicePixels(1024),
+};
+// Max texture size for DirectX. See:
+// https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-resources-limits
+const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(16384),
+    height: DevicePixels(16384),
+};
+const MAX_DEDICATED_POOL_TEXTURES: usize = 4;
+
 pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
 
 struct DirectXAtlasTextures {
@@ -21,11 +38,14 @@ struct DirectXAtlasTextures {
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
+    dedicated_pool: Vec<DirectXAtlasTexture>,
 }
 
 struct DirectXAtlasTexture {
     id: AtlasTextureId,
     bytes_per_pixel: u32,
+    size: Size<DevicePixels>,
+    dedicated: bool,
     allocator: BucketedAtlasAllocator,
     texture: ID3D11Texture2D,
     view: [Option<ID3D11ShaderResourceView>; 1],
@@ -40,6 +60,7 @@ impl DirectXAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
+            dedicated_pool: Vec::new(),
         })))
     }
 
@@ -68,6 +89,7 @@ impl DirectXAtlas {
             textures.monochrome_textures = AtlasTextureList::default();
             textures.polychrome_textures = AtlasTextureList::default();
             textures.subpixel_textures = AtlasTextureList::default();
+            textures.dedicated_pool.clear();
         });
     }
 }
@@ -123,6 +145,12 @@ impl AtlasBackend for DirectXAtlasTextures {
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
                 textures.free_list.push(texture.id.index as usize);
+                if texture.dedicated {
+                    if self.dedicated_pool.len() >= MAX_DEDICATED_POOL_TEXTURES {
+                        self.dedicated_pool.remove(0);
+                    }
+                    self.dedicated_pool.push(texture);
+                }
             } else {
                 *texture_slot = Some(texture);
             }
@@ -136,23 +164,58 @@ impl DirectXAtlasTextures {
         size: Size<DevicePixels>,
         texture_kind: AtlasTextureKind,
     ) -> Option<AtlasTile> {
+        let is_dedicated =
+            size.width > DEFAULT_ATLAS_SIZE.width || size.height > DEFAULT_ATLAS_SIZE.height;
+        if !is_dedicated {
+            {
+                let textures = match texture_kind {
+                    AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+                    AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+                    AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
+                };
+
+                if let Some(tile) = textures
+                    .iter_mut()
+                    .rev()
+                    .find_map(|texture| (!texture.dedicated).then(|| texture.allocate(size)).flatten())
+                {
+                    return Some(tile);
+                }
+            }
+
+            let texture = self.push_texture(size, texture_kind, false)?;
+            return texture.allocate(size);
+        }
+
+        let tex_size = size.min(&MAX_ATLAS_SIZE);
+        if let Some(pos) = self
+            .dedicated_pool
+            .iter()
+            .position(|t| t.id.kind == texture_kind && t.size == tex_size)
         {
-            let textures = match texture_kind {
+            let mut texture = self.dedicated_pool.swap_remove(pos);
+            let texture_list = match texture_kind {
                 AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
                 AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
                 AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
             };
-
-            if let Some(tile) = textures
-                .iter_mut()
-                .rev()
-                .find_map(|texture| texture.allocate(size))
-            {
-                return Some(tile);
-            }
+            let index = texture_list.free_list.pop();
+            let id_index = index.unwrap_or(texture_list.textures.len()) as u32;
+            texture.id = AtlasTextureId {
+                index: id_index,
+                kind: texture_kind,
+            };
+            let slot_ref = if let Some(ix) = index {
+                texture_list.textures[ix] = Some(texture);
+                texture_list.textures.get_mut(ix).unwrap().as_mut().unwrap()
+            } else {
+                texture_list.textures.push(Some(texture));
+                texture_list.textures.last_mut().unwrap().as_mut().unwrap()
+            };
+            return slot_ref.allocate(size);
         }
 
-        let texture = self.push_texture(size, texture_kind)?;
+        let texture = self.push_texture(tex_size, texture_kind, true)?;
         texture.allocate(size)
     }
 
@@ -160,18 +223,13 @@ impl DirectXAtlasTextures {
         &mut self,
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
+        dedicated: bool,
     ) -> Option<&mut DirectXAtlasTexture> {
-        const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
+        let size = if dedicated {
+            min_size.min(&MAX_ATLAS_SIZE)
+        } else {
+            min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE)
         };
-        // Max texture size for DirectX. See:
-        // https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-resources-limits
-        const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(16384),
-            height: DevicePixels(16384),
-        };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
         let pixel_format;
         let bind_flag;
         let bytes_per_pixel;
@@ -202,9 +260,17 @@ impl DirectXAtlasTextures {
                 Count: 1,
                 Quality: 0,
             },
-            Usage: D3D11_USAGE_DEFAULT,
+            Usage: if dedicated {
+                D3D11_USAGE_DYNAMIC
+            } else {
+                D3D11_USAGE_DEFAULT
+            },
             BindFlags: bind_flag.0 as u32,
-            CPUAccessFlags: 0,
+            CPUAccessFlags: if dedicated {
+                D3D11_CPU_ACCESS_WRITE.0 as u32
+            } else {
+                0
+            },
             MiscFlags: 0,
         };
         let mut texture: Option<ID3D11Texture2D> = None;
@@ -236,6 +302,8 @@ impl DirectXAtlasTextures {
                 kind,
             },
             bytes_per_pixel,
+            size,
+            dedicated,
             allocator: etagere::BucketedAtlasAllocator::new(device_size_to_etagere(size)),
             texture,
             view,
@@ -288,7 +356,8 @@ impl DirectXAtlasTexture {
         // out instead. This is a first-insert path rather than a per-frame one, so the check is
         // effectively free.
         let row_bytes = bounds.size.width.to_bytes(self.bytes_per_pixel as u8) as usize;
-        let expected = row_bytes * bounds.size.height.0.max(0) as usize;
+        let height = bounds.size.height.0.max(0) as usize;
+        let expected = row_bytes * height;
         if bytes.len() < expected {
             log::error!(
                 "DirectXAtlasTexture::upload: source slice is {} bytes but the {}x{} region \
@@ -299,6 +368,39 @@ impl DirectXAtlasTexture {
                 expected,
             );
             return;
+        }
+        if self.dedicated && bounds.origin.x.0 == 0 && bounds.origin.y.0 == 0 {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if unsafe {
+                device_context.Map(
+                    &self.texture,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )
+            }
+            .is_ok()
+            {
+                let dst = mapped.pData as *mut u8;
+                let dst_pitch = mapped.RowPitch as usize;
+                unsafe {
+                    if dst_pitch == row_bytes {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, expected);
+                    } else {
+                        let copy_bytes = row_bytes.min(dst_pitch);
+                        for row in 0..height {
+                            std::ptr::copy_nonoverlapping(
+                                bytes.as_ptr().add(row * row_bytes),
+                                dst.add(row * dst_pitch),
+                                copy_bytes,
+                            );
+                        }
+                    }
+                    device_context.Unmap(&self.texture, 0);
+                }
+                return;
+            }
         }
         unsafe {
             device_context.UpdateSubresource(
@@ -416,5 +518,29 @@ mod tests {
 
         let tile_b = insert_tile(&atlas, big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    #[test]
+    fn test_dedicated_texture_is_pooled_and_reused() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let full_hd = Size {
+            width: DevicePixels(1920),
+            height: DevicePixels(1080),
+        };
+        let key_a = make_image_key(10);
+        let key_b = make_image_key(11);
+
+        let tile_a = insert_tile(&atlas, key_a.clone(), full_hd);
+        assert_eq!(tile_a.bounds.size, full_hd);
+
+        atlas.remove(&key_a);
+        assert_eq!(atlas.0.lock().backend.dedicated_pool.len(), 1);
+
+        let tile_b = insert_tile(&atlas, key_b, full_hd);
+        assert_eq!(tile_b.texture_id, tile_a.texture_id);
+        assert!(atlas.0.lock().backend.dedicated_pool.is_empty());
     }
 }

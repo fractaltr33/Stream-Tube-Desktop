@@ -289,6 +289,19 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
 #[derive(Clone, Copy)]
 struct Block([u8; 64]);
 
+/// Sets byte 3 of every BGRA pixel to `0xFF` in-place.
+///
+/// # Safety
+/// `data` must be 8-byte aligned and its length must be a multiple of 8.
+#[inline]
+unsafe fn set_opaque_alpha_in_place(data: &mut [u8]) {
+    let opaque64 = u64::from_ne_bytes([0, 0, 0, 0xFF, 0, 0, 0, 0xFF]);
+    let words = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u64, data.len() / 8) };
+    for px in words {
+        *px |= opaque64;
+    }
+}
+
 impl Mpv {
     /// Creates a player. `events` receives property changes and frame notifications.
     pub fn new(options: &[(&str, &str)], events: impl Fn(MpvEvent) + Send + Sync + 'static) -> Result<Arc<Self>> {
@@ -417,6 +430,7 @@ impl Mpv {
                 let rc_ptr = rc_ptr;
                 let (_, f) = lib().unwrap();
                 let mut buf: Vec<Block> = Vec::new();
+                let mut spare: Option<Vec<u8>> = None;
                 let mut last_size = (0u32, 0u32);
                 let fmt = CString::new("bgr0").unwrap();
                 loop {
@@ -440,14 +454,39 @@ impl Mpv {
                     let h = th.max(16);
                     let stride = w as usize * 4;
                     let bytes = stride * h as usize;
-                    let blocks = bytes.div_ceil(64);
-                    if (w, h) != last_size {
-                        // a new size reinterprets the old pixels at a different stride, which
-                        // shows up as streaks until mpv has a frame to draw: start from black
-                        last_size = (w, h);
-                        buf.clear();
-                        buf.resize(blocks, Block([0; 64]));
-                    }
+                    let size_changed = (w, h) != last_size;
+                    last_size = (w, h);
+
+                    // Reuse an unpicked frame buffer or our local spare, otherwise allocate
+                    // exact capacity (served from LargeBufferAllocator on Windows).
+                    let mut data = r
+                        .frame
+                        .lock()
+                        .take()
+                        .map(|f| f.data)
+                        .filter(|d| d.capacity() == bytes)
+                        .or_else(|| spare.take().filter(|d| d.capacity() == bytes))
+                        .unwrap_or_else(|| Vec::with_capacity(bytes));
+                    data.clear();
+
+                    // If `data` is 64-byte aligned (true for all >= 512 KiB allocations on
+                    // Windows via VirtualAlloc), render directly into it and fix alpha in-place
+                    // to eliminate an extra 8.3 MB buffer and per-frame copy at 1080p.
+                    let direct = (data.as_ptr() as usize) & 63 == 0;
+                    let ptr = if direct {
+                        if size_changed {
+                            // a new size reinterprets old pixels at a different stride: start from black
+                            unsafe { std::ptr::write_bytes(data.as_mut_ptr(), 0, bytes) };
+                        }
+                        data.as_mut_ptr()
+                    } else {
+                        let blocks = bytes.div_ceil(64);
+                        if size_changed || buf.len() != blocks {
+                            buf.clear();
+                            buf.resize(blocks, Block([0; 64]));
+                        }
+                        buf.as_mut_ptr() as *mut u8
+                    };
                     let mut size = [w as c_int, h as c_int];
                     let mut stride_v: usize = stride;
                     let mut no_block: c_int = 0;
@@ -455,7 +494,7 @@ impl Mpv {
                         mpv_render_param { kind: RP_SW_SIZE, data: size.as_mut_ptr() as *mut c_void },
                         mpv_render_param { kind: RP_SW_FORMAT, data: fmt.as_ptr() as *mut c_void },
                         mpv_render_param { kind: RP_SW_STRIDE, data: &mut stride_v as *mut usize as *mut c_void },
-                        mpv_render_param { kind: RP_SW_POINTER, data: buf.as_mut_ptr() as *mut c_void },
+                        mpv_render_param { kind: RP_SW_POINTER, data: ptr as *mut c_void },
                         mpv_render_param { kind: RP_BLOCK_FOR_TARGET_TIME, data: &mut no_block as *mut c_int as *mut c_void },
                         mpv_render_param { kind: 0, data: std::ptr::null_mut() },
                     ];
@@ -464,26 +503,23 @@ impl Mpv {
                     crate::perf::add(&crate::perf::MPV_RENDER_US, t0.elapsed().as_micros() as u64);
                     crate::perf::add(&crate::perf::MPV_FRAMES, 1);
                     if rc < 0 {
+                        spare = Some(data);
                         continue;
                     }
-                    // one pass: copy each pixel out with its padding byte set to opaque
-                    // (the buffer is 64-byte aligned, so reading it as u32 is fine)
-                    let src = std::slice::from_raw_parts(buf.as_ptr() as *const u32, bytes / 4);
-                    let opaque = u32::from_ne_bytes([0, 0, 0, 0xFF]);
-                    // a frame the UI never picked up gives its buffer back; otherwise a
-                    // fresh one, written once (not zeroed first: ~8 MB a frame at 1080p)
-                    let mut data = r.frame.lock().take().map(|f| f.data).filter(|d| d.capacity() >= bytes).unwrap_or_default();
-                    data.clear();
-                    data.reserve_exact(bytes);
-                    for (d, s) in data.spare_capacity_mut()[..bytes].chunks_exact_mut(4).zip(src) {
-                        let px = (s | opaque).to_ne_bytes();
-                        // SAFETY: `d` is a 4-byte slice inside `spare_capacity_mut()[..bytes]`
+                    if direct {
                         unsafe {
-                            std::ptr::copy_nonoverlapping(px.as_ptr(), d.as_mut_ptr() as *mut u8, 4);
+                            data.set_len(bytes);
+                            set_opaque_alpha_in_place(&mut data);
                         }
+                    } else {
+                        let src = std::slice::from_raw_parts(buf.as_ptr() as *const u32, bytes / 4);
+                        let opaque = u32::from_ne_bytes([0, 0, 0, 0xFF]);
+                        for (d, s) in data.spare_capacity_mut()[..bytes].chunks_exact_mut(4).zip(src) {
+                            let px = (s | opaque).to_ne_bytes();
+                            unsafe { std::ptr::copy_nonoverlapping(px.as_ptr(), d.as_mut_ptr() as *mut u8, 4) };
+                        }
+                        unsafe { data.set_len(bytes) };
                     }
-                    // SAFETY: the loop above wrote all `bytes` bytes (bytes is w*h*4, src has w*h pixels)
-                    data.set_len(bytes);
                     let serial = r.serial.fetch_add(1, Ordering::Relaxed) + 1;
                     *r.frame.lock() = Some(VideoFrame { width: w, height: h, data, serial });
                     frame_cb(MpvEvent::Frame);
@@ -621,4 +657,18 @@ fn err_str(rc: c_int) -> String {
         .ok()
         .map(|(_, f)| unsafe { CStr::from_ptr((f.error_string)(rc)).to_string_lossy().into_owned() })
         .unwrap_or_else(|| rc.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sets_opaque_alpha_in_place_preserving_bgr() {
+        let buf = [0x11u8, 0x22, 0x33, 0x00, 0x44, 0x55, 0x66, 0x7F];
+        let mut aligned = vec![0u8; 128];
+        let offset = (64 - (aligned.as_ptr() as usize % 64)) % 64;
+        let slice = &mut aligned[offset..offset + 8];
+        slice.copy_from_slice(&buf);
+        unsafe { super::set_opaque_alpha_in_place(slice) };
+        assert_eq!(slice, &[0x11, 0x22, 0x33, 0xFF, 0x44, 0x55, 0x66, 0xFF]);
+    }
 }

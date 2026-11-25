@@ -579,6 +579,9 @@ impl Player {
         if let Some(old) = self.frame.take() {
             cx.drop_image(old, None);
         }
+        for old in self.old_frames.drain(..) {
+            cx.drop_image(old, None);
+        }
         let _ = mpv.command(&["stop"]);
         store::history_add(&video);
         // with the browser sign-in, the video goes into the account's YouTube history
@@ -925,6 +928,12 @@ impl Player {
         if let Some(old) = self.frame.take() {
             cx.drop_image(old, None);
         }
+        for old in self.old_frames.drain(..) {
+            cx.drop_image(old, None);
+        }
+        if on {
+            crate::alloc_cache::purge();
+        }
         let t = self.time;
         self.load_current(Some(t), true, cx);
     }
@@ -1150,6 +1159,10 @@ impl Player {
         if let Some(old) = self.frame.take() {
             cx.drop_image(old, None);
         }
+        for old in self.old_frames.drain(..) {
+            cx.drop_image(old, None);
+        }
+        crate::alloc_cache::purge();
         cx.notify();
     }
 

@@ -3,7 +3,7 @@ name: Build Windows Patch Exe
 on:
   push:
     branches: ["**"]
-    paths: ["src/**", "Cargo.toml", "Cargo.lock", "build.rs", ".github/workflows/build-windows-exe.yml"]
+    paths: ["src/**", "vendor/**", "Cargo.toml", "Cargo.lock", "build.rs", ".github/workflows/build-windows-exe.yml"]
   workflow_dispatch:
 
 permissions:
@@ -37,7 +37,9 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run unit tests
-        run: cargo test --release --locked
+        run: |
+          cargo test --release --locked
+          cargo test --release --locked -p gpui-pre-windows
 
       - name: Stage artifact
         shell: pwsh
