@@ -4,14 +4,15 @@
 //! throttles large single requests. mpv asks for whole files, so it talks to
 //! this proxy instead, which serves mpv's (possibly open-ended) ranges by
 //! fetching bounded chunks from YouTube, like yt-dlp's chunked downloader.
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use parking_lot::{Condvar, Mutex};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 const FIRST_CHUNK: u64 = 1 << 20; // small first chunk: fast start and seeks
 const CHUNK: u64 = 8 << 20;
+const PROXY_WORKERS: usize = 16;
 
 struct Entry {
     url: String,
@@ -33,13 +34,35 @@ fn proxy() -> Option<&'static Proxy> {
     P.get_or_init(|| {
         let listener = TcpListener::bind("127.0.0.1:0").ok()?;
         let port = listener.local_addr().ok()?.port();
+        let queue = Arc::new((Mutex::new(VecDeque::<TcpStream>::new()), Condvar::new()));
+        for i in 0..PROXY_WORKERS {
+            let q = queue.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("stream-proxy-{i}"))
+                .spawn(move || {
+                    let (lock, cv) = &*q;
+                    loop {
+                        let conn = {
+                            let mut guard = lock.lock();
+                            while guard.is_empty() {
+                                cv.wait(&mut guard);
+                            }
+                            guard.pop_front()
+                        };
+                        if let Some(conn) = conn {
+                            let _ = serve(conn);
+                        }
+                    }
+                });
+        }
         std::thread::Builder::new()
             .name("stream-proxy".into())
             .spawn(move || {
+                let (lock, cv) = &*queue;
                 for conn in listener.incoming().flatten() {
-                    std::thread::spawn(move || {
-                        let _ = serve(conn);
-                    });
+                    let mut guard = lock.lock();
+                    guard.push_back(conn);
+                    cv.notify_one();
                 }
             })
             .ok()?;

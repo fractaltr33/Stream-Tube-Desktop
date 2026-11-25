@@ -476,8 +476,10 @@ impl Mpv {
                     data.clear();
                     data.reserve_exact(bytes);
                     for (d, s) in data.spare_capacity_mut()[..bytes].chunks_exact_mut(4).zip(src) {
-                        for (o, b) in d.iter_mut().zip((s | opaque).to_ne_bytes()) {
-                            o.write(b);
+                        let px = (s | opaque).to_ne_bytes();
+                        // SAFETY: `d` is a 4-byte slice inside `spare_capacity_mut()[..bytes]`
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(px.as_ptr(), d.as_mut_ptr() as *mut u8, 4);
                         }
                     }
                     // SAFETY: the loop above wrote all `bytes` bytes (bytes is w*h*4, src has w*h pixels)

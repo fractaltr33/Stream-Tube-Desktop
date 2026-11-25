@@ -1,0 +1,55 @@
+name: Build Windows Patch Exe
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["src/**", "Cargo.toml", "Cargo.lock", "build.rs", ".github/workflows/build-windows-exe.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MPV_URL: https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z
+  MPV_SHA256: 273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download libmpv-2.dll
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:MPV_URL -OutFile mpv.7z
+          $hash = (Get-FileHash mpv.7z -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:MPV_SHA256) { throw "libmpv archive checksum mismatch: $hash" }
+          New-Item -ItemType Directory -Force third_party/mpv | Out-Null
+          7z e -y mpv.7z libmpv-2.dll -othird_party/mpv | Out-Null
+          Get-Item third_party/mpv/libmpv-2.dll
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run unit tests
+        run: cargo test --release --locked
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-patch | Out-Null
+          Copy-Item target/release/streamtube.exe dist-patch/streamtube.exe
+          Copy-Item third_party/mpv/libmpv-2.dll dist-patch/libmpv-2.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamtube-windows-x64
+          path: |
+            dist-patch/streamtube.exe
+            dist-patch/libmpv-2.dll
+          if-no-files-found: error

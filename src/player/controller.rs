@@ -172,7 +172,7 @@ impl Player {
         let vol = format!("{}", s.volume.round());
         let ua = crate::api::http::BROWSER_UA;
         let hw = if s.hwdec { "auto-copy" } else { "no" };
-        let opts: Vec<(&str, &str)> = vec![
+        let mut opts: Vec<(&str, &str)> = vec![
             ("vo", "libmpv"),
             ("hwdec", hw),
             ("keep-open", "yes"),
@@ -183,9 +183,9 @@ impl Player {
             ("input-vo-keyboard", "no"),
             ("osc", "no"),
             ("cache", "yes"),
-            ("demuxer-max-bytes", "48MiB"),
-            ("demuxer-max-back-bytes", "12MiB"),
-            ("demuxer-readahead-secs", "40"),
+            ("demuxer-max-bytes", "16MiB"),
+            ("demuxer-max-back-bytes", "4MiB"),
+            ("demuxer-readahead-secs", "15"),
             ("network-timeout", "20"),
             ("user-agent", ua),
             ("volume", &vol),
@@ -193,6 +193,12 @@ impl Player {
             ("hr-seek", "yes"),
             ("force-seekable", "yes"),
             ("audio-client-name", "Stream Tube"),
+            #[cfg(target_os = "windows")]
+            ("ao", "wasapi"),
+            #[cfg(target_os = "windows")]
+            ("audio-buffer", "0.5"),
+            #[cfg(target_os = "windows")]
+            ("audio-stream-silence", "yes"),
             ("sub-font-size", "42"),
             ("sub-border-size", "2.5"),
             ("sub-auto", "no"),
@@ -211,9 +217,8 @@ impl Player {
             ("video-sync", "audio"),
             ("framedrop", "vo"),
         ];
-        let opts: Vec<(&str, &str)> = opts.into_iter().collect();
         let proxy = s.proxy.clone();
-        let mut opts_owned: Vec<(String, String)> = opts.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let mut opts_owned: Vec<(String, String)> = opts.drain(..).map(|(a, b)| (a.to_string(), b.to_string())).collect();
         // normal videos reach mpv through the app's local stream proxy, which already
         // uses the user's proxy; mpv itself only fetches live streams directly, and can
         // only use HTTP proxies (127.0.0.1 is excluded through no_proxy, see main)
@@ -222,6 +227,18 @@ impl Player {
         }
         if let Ok(f) = std::env::var("STREAMTUBE_MPV_LOG") {
             opts_owned.push(("log-file".into(), f));
+        }
+        // Enable user mpv.conf (prefer %APPDATA%\StreamTube, fall back to exe directory)
+        // and apply its key=value entries on top of defaults so they always take precedence.
+        let config_dir = resolve_mpv_config_dir();
+        opts_owned.push(("config".into(), "yes".into()));
+        opts_owned.push(("config-dir".into(), config_dir.to_string_lossy().into_owned()));
+        for (k, v) in load_mpv_conf_overrides(&config_dir.join("mpv.conf")) {
+            if let Some(existing) = opts_owned.iter_mut().find(|(ek, _)| ek == &k) {
+                existing.1 = v;
+            } else {
+                opts_owned.push((k, v));
+            }
         }
         let refs: Vec<(&str, &str)> = opts_owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         match Mpv::new(&refs, move |ev| {
@@ -1676,5 +1693,109 @@ mod chapter_tests {
         assert_eq!(chapter_target(&c, 60.0, -1), Some(0.0));
         assert_eq!(chapter_target(&c, 10.0, -1), Some(0.0));
         assert_eq!(chapter_target(&[], 10.0, 1), None);
+    }
+}
+
+/// Resolves the directory used for `mpv.conf`: `%APPDATA%\StreamTube` (via `store::data_dir()`)
+/// by default, or the executable directory if `mpv.conf` exists there and not in `data_dir()`.
+fn resolve_mpv_config_dir() -> std::path::PathBuf {
+    let data = crate::store::data_dir();
+    if data.join("mpv.conf").is_file() {
+        return data;
+    }
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+        if exe_dir.join("mpv.conf").is_file() {
+            return exe_dir;
+        }
+    }
+    data
+}
+
+/// Parses `key=value` options from `mpv.conf` so user settings override `ensure_mpv` defaults.
+fn load_mpv_conf_overrides(path: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_mpv_conf(&text)
+}
+
+fn parse_mpv_conf(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let mut line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Stop at profile sections so profile-scoped options are left to mpv itself.
+        if line.starts_with('[') && line.ends_with(']') {
+            break;
+        }
+        // Strip inline `#` comment when not inside quotes.
+        let mut in_quote: Option<char> = None;
+        for (idx, ch) in line.char_indices() {
+            match (in_quote, ch) {
+                (None, '"' | '\'') => in_quote = Some(ch),
+                (Some(q), c) if q == c => in_quote = None,
+                (None, '#') => {
+                    line = line[..idx].trim();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let line = line.strip_prefix("--").unwrap_or(line);
+        let (key, val) = match line.split_once('=') {
+            Some((k, v)) => {
+                let k = k.trim();
+                let mut v = v.trim();
+                if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                    || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+                {
+                    v = &v[1..v.len() - 1];
+                }
+                (k, v.to_string())
+            }
+            None => {
+                if let Some(rest) = line.strip_prefix("no-") {
+                    (rest, "no".to_string())
+                } else {
+                    (line, "yes".to_string())
+                }
+            }
+        };
+        if !key.is_empty() {
+            out.push((key.to_string(), val));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod mpv_conf_tests {
+    use super::parse_mpv_conf;
+
+    #[::core::prelude::v1::test]
+    fn parses_key_values_comments_and_profiles() {
+        let conf = r#"
+# Windows audio fix
+ao=wasapi
+audio-buffer = 0.6 # half second
+log-file="C:\temp\mpv.log"
+audio-stream-silence
+[my-profile]
+ao=sdl
+"#;
+        assert_eq!(
+            parse_mpv_conf(conf),
+            vec![
+                ("ao".into(), "wasapi".into()),
+                ("audio-buffer".into(), "0.6".into()),
+                ("log-file".into(), r"C:\temp\mpv.log".into()),
+                ("audio-stream-silence".into(), "yes".into()),
+            ]
+        );
     }
 }
