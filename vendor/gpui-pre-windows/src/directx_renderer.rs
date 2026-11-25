@@ -28,6 +28,18 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+// Stream Tube patch: sentinel background color for native child-HWND video hole punch-out.
+const VIDEO_HOLE_SENTINEL: Hsla = Hsla {
+    h: 0.37123,
+    s: 0.77123,
+    l: 0.01123,
+    a: 1.0,
+};
+
+#[inline]
+fn is_video_hole_quad(quad: &Quad) -> bool {
+    quad.background.as_solid() == Some(VIDEO_HOLE_SENTINEL)
+}
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -86,6 +98,7 @@ struct DirectXResources {
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
+    hole_blend_state: ID3D11BlendState,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -368,7 +381,7 @@ impl DirectXRenderer {
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
-                PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
+                PrimitiveBatch::Quads(range) => self.draw_quads(&scene.quads, range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     self.draw_paths_to_intermediate(paths)?;
@@ -596,20 +609,36 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_quads(&mut self, start: usize, len: usize) -> Result<()> {
+    fn draw_quads(&mut self, quads: &[Quad], start: usize, len: usize) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
         let devices = self.devices.as_ref().context("devices missing")?;
-        self.pipelines.quad_pipeline.draw_range(
-            &devices.device_context,
-            self.globals
-                .batch_params_buffer
-                .as_ref()
-                .context("batch params buffer missing")?,
-            start as u32,
-            len as u32,
-        )
+        let batch_params = self
+            .globals
+            .batch_params_buffer
+            .as_ref()
+            .context("batch params buffer missing")?;
+
+        let end = start + len;
+        let mut cursor = start;
+        while cursor < end {
+            let is_hole = is_video_hole_quad(&quads[cursor]);
+            let mut run_end = cursor + 1;
+            while run_end < end && is_video_hole_quad(&quads[run_end]) == is_hole {
+                run_end += 1;
+            }
+            let blend_override = is_hole.then_some(&self.pipelines.hole_blend_state);
+            self.pipelines.quad_pipeline.draw_range_with_blend(
+                &devices.device_context,
+                batch_params,
+                cursor as u32,
+                (run_end - cursor) as u32,
+                blend_override,
+            )?;
+            cursor = run_end;
+        }
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -990,6 +1019,7 @@ impl DirectXRenderPipelines {
             512,
             create_blend_state_for_subpixel_rendering(device)?,
         )?;
+        let hole_blend_state = create_blend_state_for_hole(device)?;
         let poly_sprites = PipelineState::new(
             device,
             "polychrome_sprite_pipeline",
@@ -1001,6 +1031,7 @@ impl DirectXRenderPipelines {
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
+            hole_blend_state,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1014,7 +1045,9 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
+        // Stream Tube patch: topmost = true keeps GPUI's DirectComposition swapchain above
+        // native child HWNDs (e.g. libmpv wid) so UI overlays composite cleanly through alpha holes.
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
@@ -1213,6 +1246,23 @@ impl<T> PipelineState<T> {
         first_instance: u32,
         instance_count: u32,
     ) -> Result<()> {
+        self.draw_range_with_blend(
+            device_context,
+            batch_params_buffer,
+            first_instance,
+            instance_count,
+            None,
+        )
+    }
+
+    fn draw_range_with_blend(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        batch_params_buffer: &ID3D11Buffer,
+        first_instance: u32,
+        instance_count: u32,
+        blend_override: Option<&ID3D11BlendState>,
+    ) -> Result<()> {
         anyhow::ensure!(
             first_instance as usize + instance_count as usize <= self.buffer_size,
             "DirectX instance range exceeds the {} buffer",
@@ -1225,7 +1275,7 @@ impl<T> PipelineState<T> {
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             &self.vertex,
             &self.fragment,
-            &self.blend_state,
+            blend_override.unwrap_or(&self.blend_state),
         );
         unsafe {
             device_context.DrawInstanced(4, instance_count, 0, 0);
@@ -1499,6 +1549,26 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
+fn create_blend_state_for_hole(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    // Stream Tube patch: clears destination color & alpha proportionally to quad coverage
+    // (Src = 0, Dst = INV_SRC_ALPHA) so child-HWND video shows through GPUI's swapchain.
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = true.into();
+    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO;
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
@@ -2054,5 +2124,29 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_hole_sentinel_matches_only_sentinel_quads() {
+        let mut hole_quad = Quad::default();
+        hole_quad.background = VIDEO_HOLE_SENTINEL.into();
+        assert!(is_video_hole_quad(&hole_quad));
+
+        let mut normal_quad = Quad::default();
+        normal_quad.background = black().into();
+        assert!(!is_video_hole_quad(&normal_quad));
+
+        let mut gradient_quad = Quad::default();
+        gradient_quad.background = linear_gradient(
+            0.0,
+            linear_color_stop(VIDEO_HOLE_SENTINEL, 0.0),
+            linear_color_stop(black(), 1.0),
+        );
+        assert!(!is_video_hole_quad(&gradient_quad));
     }
 }

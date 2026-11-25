@@ -558,6 +558,17 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
 
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
+
+    // Stream Tube patch: punch a premultiplied-alpha transparent hole for native child-HWND video.
+    if (quad.background.tag == 0u
+        && abs(quad.background.solid.h - 0.37123f) < 1e-5f
+        && abs(quad.background.solid.s - 0.77123f) < 1e-5f
+        && abs(quad.background.solid.l - 0.01123f) < 1e-5f) {
+        float sdf = quad_sdf(input.position.xy, quad.bounds, quad.corner_radii);
+        float coverage = saturate(0.5 - sdf);
+        return float4(0.0, 0.0, 0.0, coverage);
+    }
+
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 

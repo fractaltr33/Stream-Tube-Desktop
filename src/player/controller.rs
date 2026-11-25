@@ -70,6 +70,8 @@ pub struct Player {
     pub audio_track: Option<String>,
     /// "Stats for nerds" overlay
     pub show_stats: bool,
+    host_parent: Option<isize>,
+    video_host: Option<Arc<super::video_host::VideoHost>>,
 }
 
 impl EventEmitter<PlayerEvent> for Player {}
@@ -155,6 +157,8 @@ impl Player {
             last_activity: std::time::Instant::now(),
             audio_track: None,
             show_stats: false,
+            host_parent: None,
+            video_host: None,
         }
         .with_cx(cx)
     }
@@ -167,13 +171,26 @@ impl Player {
         if let Some(m) = &self.mpv {
             return Some(m.clone());
         }
+        if self.video_host.is_none() && super::video_host::is_available() {
+            if let Some(parent) = self.host_parent {
+                match super::video_host::VideoHost::new(parent) {
+                    Ok(vh) => self.video_host = Some(Arc::new(vh)),
+                    Err(e) => log::warn!("failed to create native video host: {e}"),
+                }
+            }
+        }
+        let native_wid = self.video_host.as_ref().map(|vh| vh.hwnd());
         let s = store::settings_snapshot();
         let (tx, rx) = futures::channel::mpsc::unbounded::<MpvEvent>();
         let vol = format!("{}", s.volume.round());
         let ua = crate::api::http::BROWSER_UA;
-        let hw = if s.hwdec { "auto-copy" } else { "no" };
+        let hw = if s.hwdec {
+            if native_wid.is_some() { "auto-safe" } else { "auto-copy" }
+        } else {
+            "no"
+        };
         let mut opts: Vec<(&str, &str)> = vec![
-            ("vo", "libmpv"),
+            ("vo", if native_wid.is_some() { "gpu" } else { "libmpv" }),
             ("hwdec", hw),
             ("keep-open", "yes"),
             ("idle", "yes"),
@@ -219,6 +236,12 @@ impl Player {
         ];
         let proxy = s.proxy.clone();
         let mut opts_owned: Vec<(String, String)> = opts.drain(..).map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        if let Some(wid) = native_wid {
+            opts_owned.push(("gpu-api".into(), "d3d11".into()));
+            opts_owned.push(("wid".into(), wid.to_string()));
+            opts_owned.push(("cursor-autohide".into(), "no".into()));
+            opts_owned.push(("stop-screensaver".into(), "no".into()));
+        }
         // normal videos reach mpv through the app's local stream proxy, which already
         // uses the user's proxy; mpv itself only fetches live streams directly, and can
         // only use HTTP proxies (127.0.0.1 is excluded through no_proxy, see main)
@@ -234,6 +257,9 @@ impl Player {
         opts_owned.push(("config".into(), "yes".into()));
         opts_owned.push(("config-dir".into(), config_dir.to_string_lossy().into_owned()));
         for (k, v) in load_mpv_conf_overrides(&config_dir.join("mpv.conf")) {
+            if native_wid.is_some() && matches!(k.as_str(), "vo" | "wid" | "gpu-api") {
+                continue;
+            }
             if let Some(existing) = opts_owned.iter_mut().find(|(ek, _)| ek == &k) {
                 existing.1 = v;
             } else {
@@ -241,11 +267,12 @@ impl Player {
             }
         }
         let refs: Vec<(&str, &str)> = opts_owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-        match Mpv::new(&refs, move |ev| {
+        match Mpv::new_with_mode(&refs, native_wid.is_none(), move |ev| {
             let _ = tx.unbounded_send(ev);
         }) {
             Ok(m) => {
                 self.mpv = Some(m.clone());
+                self.sync_aspect_mode(&s.aspect_mode);
                 cx.spawn(async move |this, cx| {
                     use futures::StreamExt;
                     let mut rx = rx;
@@ -279,6 +306,58 @@ impl Player {
 
     pub fn mpv(&self) -> Option<Arc<Mpv>> {
         self.mpv.clone()
+    }
+
+    pub fn host_parent(&self) -> Option<isize> {
+        self.host_parent
+    }
+
+    pub fn set_host_parent(&mut self, hwnd: isize) {
+        self.host_parent = (hwnd != 0).then_some(hwnd);
+    }
+
+    pub fn video_host(&self) -> Option<Arc<super::video_host::VideoHost>> {
+        self.video_host.clone()
+    }
+
+    pub fn uses_native_video(&self) -> bool {
+        self.mpv.as_ref().is_some_and(|m| m.uses_native_video())
+    }
+
+    pub fn hide_video_host(&self) {
+        if let Some(vh) = &self.video_host {
+            vh.hide();
+        }
+    }
+
+    pub fn detach_video_host_to_main(&self) {
+        if let Some(vh) = &self.video_host {
+            vh.detach_to_main(self.host_parent.unwrap_or(0));
+        }
+    }
+
+    pub fn sync_aspect_mode(&self, mode: &str) {
+        let Some(m) = &self.mpv else { return };
+        if !m.uses_native_video() {
+            return;
+        }
+        match super::aspect::Mode::parse(mode) {
+            super::aspect::Mode::Fill => {
+                m.set("keepaspect", "yes");
+                m.set("panscan", "1.0");
+                m.set("video-aspect-override", "-1");
+            }
+            super::aspect::Mode::Stretch => {
+                m.set("keepaspect", "no");
+                m.set("panscan", "0.0");
+                m.set("video-aspect-override", "-1");
+            }
+            super::aspect::Mode::Original | super::aspect::Mode::Auto | super::aspect::Mode::Ratio(_) => {
+                m.set("keepaspect", "yes");
+                m.set("panscan", "0.0");
+                m.set("video-aspect-override", "-1");
+            }
+        }
     }
 
     fn handle_event(&mut self, ev: MpvEvent, cx: &mut Context<Self>) {
@@ -350,12 +429,14 @@ impl Player {
             }
             MpvEvent::Prop(name, val) => {
                 // While frames are flowing, the frame event already redraws the player;
-                // only redraw for clock/cache updates when no video frames arrive.
+                // in native child-HWND mode throttle clock/cache redraws to ~150 ms.
+                let frame_driven = !self.uses_native_video() && self.frame.is_some();
+                let prop_ms = if frame_driven { 500 } else if self.uses_native_video() { 150 } else { 0 };
                 let quiet = matches!(name, "time-pos" | "demuxer-cache-time")
                     && !self.paused
                     && !self.audio_only
-                    && self.frame.is_some()
-                    && self.last_prop_notify.elapsed() < std::time::Duration::from_millis(500);
+                    && prop_ms > 0
+                    && self.last_prop_notify.elapsed() < std::time::Duration::from_millis(prop_ms);
                 match (name, val) {
                     ("time-pos", PropValue::Double(t)) => {
                         self.time = t;
@@ -817,8 +898,14 @@ impl Player {
         let s = store::settings_snapshot();
         self.loop_video = s.loop_video;
         if let Some(m) = &self.mpv {
-            m.set("hwdec", if s.hwdec { "auto-copy" } else { "no" });
+            let hw = if s.hwdec {
+                if self.uses_native_video() { "auto-safe" } else { "auto-copy" }
+            } else {
+                "no"
+            };
+            m.set("hwdec", hw);
         }
+        self.sync_aspect_mode(&s.aspect_mode);
         self.apply_caption_style();
         if self.video.is_some() {
             if s.audio_only != self.audio_only {
@@ -932,6 +1019,7 @@ impl Player {
             cx.drop_image(old, None);
         }
         if on {
+            self.hide_video_host();
             crate::alloc_cache::purge();
         }
         let t = self.time;
@@ -1148,6 +1236,7 @@ impl Player {
             crate::api::web::report_stop(&v.id, self.time);
         }
         self.load_serial += 1;
+        self.hide_video_host();
         if let Some(m) = &self.mpv {
             let _ = m.command(&["stop"]);
         }

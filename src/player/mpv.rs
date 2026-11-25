@@ -275,6 +275,7 @@ struct RenderShared {
 pub struct Mpv {
     h: Arc<Handle>,
     render: Arc<RenderShared>,
+    native_vo: bool,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
@@ -303,8 +304,18 @@ unsafe fn set_opaque_alpha_in_place(data: &mut [u8]) {
 }
 
 impl Mpv {
-    /// Creates a player. `events` receives property changes and frame notifications.
+    /// Creates a player using libmpv's `sw` render context (`vo=libmpv`).
     pub fn new(options: &[(&str, &str)], events: impl Fn(MpvEvent) + Send + Sync + 'static) -> Result<Arc<Self>> {
+        Self::new_with_mode(options, true, events)
+    }
+
+    /// Creates a player. When `use_render_context` is false, mpv renders directly
+    /// into its configured native output (e.g. `vo=gpu` + `wid`) with no software frame thread.
+    pub fn new_with_mode(
+        options: &[(&str, &str)],
+        use_render_context: bool,
+        events: impl Fn(MpvEvent) + Send + Sync + 'static,
+    ) -> Result<Arc<Self>> {
         let (_, f) = lib()?;
         let events = Arc::new(events);
         unsafe {
@@ -334,22 +345,29 @@ impl Mpv {
                 stop: AtomicBool::new(false),
                 force: AtomicBool::new(false),
             });
-            // render context
-            let api = CString::new("sw")?;
-            let mut params = [
-                mpv_render_param { kind: RP_API_TYPE, data: api.as_ptr() as *mut c_void },
-                mpv_render_param { kind: 0, data: std::ptr::null_mut() },
-            ];
             let mut rctx: *mut mpv_render_context = std::ptr::null_mut();
-            let rc = (f.rc_create)(&mut rctx, h, params.as_mut_ptr());
-            if rc < 0 {
-                (f.terminate_destroy)(h);
-                return Err(anyhow!("render context: {}", err_str(rc)));
+            if use_render_context {
+                // render context
+                let api = CString::new("sw")?;
+                let mut params = [
+                    mpv_render_param { kind: RP_API_TYPE, data: api.as_ptr() as *mut c_void },
+                    mpv_render_param { kind: 0, data: std::ptr::null_mut() },
+                ];
+                let rc = (f.rc_create)(&mut rctx, h, params.as_mut_ptr());
+                if rc < 0 {
+                    (f.terminate_destroy)(h);
+                    return Err(anyhow!("render context: {}", err_str(rc)));
+                }
+                (f.rc_set_update_callback)(rctx, Some(on_render_update), Arc::as_ptr(&render) as *mut c_void);
             }
-            (f.rc_set_update_callback)(rctx, Some(on_render_update), Arc::as_ptr(&render) as *mut c_void);
 
             let handle = Arc::new(Handle(h));
-            let mpv = Arc::new(Mpv { h: handle.clone(), render: render.clone(), threads: Mutex::new(Vec::new()) });
+            let mpv = Arc::new(Mpv {
+                h: handle.clone(),
+                render: render.clone(),
+                native_vo: !use_render_context,
+                threads: Mutex::new(Vec::new()),
+            });
 
             // event thread
             let ev_handle = handle.clone();
@@ -421,6 +439,11 @@ impl Mpv {
                 #[cfg(windows)]
                 set_playback_awake(false, false);
             })?;
+
+            if !use_render_context {
+                mpv.threads.lock().push(t1);
+                return Ok(mpv);
+            }
 
             // render thread
             let r = render.clone();
@@ -531,8 +554,15 @@ impl Mpv {
         }
     }
 
+    pub fn uses_native_video(&self) -> bool {
+        self.native_vo
+    }
+
     /// Sets the size frames are rendered at (physical pixels).
     pub fn set_render_size(&self, w: u32, h: u32) {
+        if self.native_vo {
+            return;
+        }
         let mut t = self.render.target.lock();
         let (w, h) = (w.clamp(16, 3840), h.clamp(16, 2160));
         if *t != (w, h) {
@@ -544,6 +574,9 @@ impl Mpv {
 
     /// Forces a re-render of the current frame (e.g. after resize while paused).
     pub fn redraw(&self) {
+        if self.native_vo {
+            return;
+        }
         self.render.force.store(true, Ordering::Relaxed);
         let mut w = self.render.wake.lock();
         *w = true;

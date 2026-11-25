@@ -39,7 +39,11 @@ pub fn open(cx: &mut App) {
         window_min_size: Some(gpui_kit::size(px(256.), px(144.))),
         ..Default::default()
     };
-    let res = gpui_kit::open_window(opts, cx, |_, cx| {
+    let res = gpui_kit::open_window(opts, cx, |window, cx| {
+        window.on_window_should_close(cx, |_, cx| {
+            player(cx).read(cx).detach_video_host_to_main();
+            true
+        });
         let pl = player(cx);
         let view = cx.new(|cx| {
             let mut v = PlayerView::new(pl, false, cx);
@@ -56,6 +60,7 @@ pub fn open(cx: &mut App) {
 }
 
 pub fn close(window: &mut Window, cx: &mut App) {
+    player(cx).read(cx).detach_video_host_to_main();
     cx.set_global(PipWindow(None));
     window.remove_window();
     cx.refresh_windows();

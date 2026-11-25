@@ -24,3 +24,13 @@ Every change is marked with "Stream Tube patch". Drop this folder and the
   video frames) are created as `D3D11_USAGE_DYNAMIC` with `D3D11_CPU_ACCESS_WRITE`,
   uploaded via `Map(D3D11_MAP_WRITE_DISCARD)`, and pooled (up to 4 textures) on
   `remove()` instead of destroying and recreating `ID3D11Texture2D` every frame.
+
+## Topmost DirectComposition & video hole quads (`src/directx_renderer.rs`, `src/shaders.hlsl`)
+
+- `DirectComposition::new` calls `CreateTargetForHwnd(hwnd, true)` (`topmost = true`)
+  so GPUI's premultiplied DirectComposition swapchain composites above native
+  child `HWND` surfaces (used for zero-copy `libmpv` `vo=gpu` `d3d11` `wid`).
+- Quads painted with the solid sentinel color `hsla(0.37123, 0.77123, 0.01123, 1.0)`
+  are split into their own draw batch using `hole_blend_state` (`Src = ZERO`,
+  `Dst = INV_SRC_ALPHA`), punching a rounded/clipped transparent alpha hole
+  through GPUI's swapchain while preserving overlays painted after the quad.

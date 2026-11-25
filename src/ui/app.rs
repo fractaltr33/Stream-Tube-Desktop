@@ -624,6 +624,9 @@ impl AppView {
             crate::save_window_bounds(window);
             true
         });
+        if let Some(hwnd) = crate::player::video_host::hwnd_from_window(window) {
+            p.update(cx, |p, _| p.set_host_parent(hwnd));
+        }
         let mini_view = cx.new(|cx| PlayerView::new(p.clone(), true, cx));
         let main_view = cx.new(|cx| PlayerView::new(p.clone(), false, cx));
         let preview_view = cx.new(crate::player::preview::PreviewView::new);
@@ -3219,6 +3222,9 @@ impl Render for AppView {
         }
         root = root.children(self.render_dl_panel(cx));
         root = root.children(self.render_menu(cx)).children(self.render_dialog(cx)).child(self.render_toasts(cx));
+        if !has_slot && (fullscreen || player(cx).read(cx).video.is_none()) && crate::ui::pip::handle(cx).is_none() {
+            player(cx).read(cx).hide_video_host();
+        }
         root
     }
 }

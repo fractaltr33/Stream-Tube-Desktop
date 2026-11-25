@@ -186,6 +186,7 @@ fn hide_pointer_until_moved() {
 /// Saves the aspect mode (a value of `aspect::MODES`) and redraws every player with it.
 pub fn set_aspect_mode(value: &str, cx: &mut App) {
     store::update_settings(|s| s.aspect_mode = value.to_string());
+    crate::player::controller::player(cx).update(cx, |p, _| p.sync_aspect_mode(value));
     cx.refresh_windows();
 }
 
@@ -203,7 +204,9 @@ impl Render for PlayerView {
         let time = self.drag_seek.map(|f| f as f64 * pl.duration).unwrap_or(pl.time);
         let duration = pl.duration;
         let frame = pl.frame.clone();
-        let loading = pl.loading || pl.buffering || (pl.seeking && pl.paused == false && frame.is_none());
+        let native_video = pl.uses_native_video();
+        let video_host = pl.video_host();
+        let loading = pl.loading || pl.buffering || (!native_video && pl.seeking && pl.paused == false && frame.is_none());
         let error = pl.error.clone().or(pl.init_error.clone());
         let audio_only = pl.audio_only;
         let video = pl.video.clone();
@@ -216,15 +219,33 @@ impl Render for PlayerView {
         let aspect = aspect::Mode::parse(&store::settings_snapshot().aspect_mode);
         let auto_trim = pl.auto_crop.trim;
         let picture = frame.clone().filter(|_| !audio_only);
+        let pip_open = crate::ui::pip::handle(cx).is_some();
+        let owns_native_host = !pip_open || self.pip;
+        let show_native_video = native_video && !audio_only && error.is_none() && video.is_some() && owns_native_host;
+        let hole_corners = if self.pip || ui.fullscreen || ui.theater {
+            Corners::default()
+        } else if mini {
+            Corners {
+                top_left: px(12.),
+                top_right: px(12.),
+                bottom_right: px(0.),
+                bottom_left: px(0.),
+            }
+        } else {
+            Corners::all(px(12.))
+        };
 
         // ── video surface ──
         let surface = div()
             .absolute()
             .inset_0()
-            .bg(black())
+            .when(!show_native_video, |d| d.bg(black()))
             .child(
                 canvas(
                     move |bounds, _, _| {
+                        if native_video {
+                            return;
+                        }
                         if let Some(m) = &mpv {
                             // Render at the video's own resolution (capped at 1080p): mpv then
                             // only converts colors, and the GPU scales the image for display.
@@ -240,15 +261,45 @@ impl Render for PlayerView {
                         }
                     },
                     move |bounds, _, window, _| {
-                        // the frame, cropped / zoomed for the aspect mode; what falls
-                        // outside the player is clipped by paint_image
-                        if let Some(f) = picture {
-                            let dims = f.size(0);
-                            let fsize = (i32::from(dims.width) as f32, i32::from(dims.height) as f32);
-                            let (region, fit) = aspect::resolve(aspect, fsize, (vsize.0 as f32, vsize.1 as f32), auto_trim);
-                            let (x, y, w, h) = aspect::layout((f32::from(bounds.size.width), f32::from(bounds.size.height)), fsize, region, fit);
-                            let image = Bounds::new(bounds.origin + point(px(x), px(y)), size(px(w), px(h)));
-                            let _ = window.paint_image(bounds, image, Corners::default(), f, 0, false);
+                        if show_native_video {
+                            if let Some(vh) = &video_host {
+                                if let Some(parent_hwnd) = super::video_host::hwnd_from_window(window) {
+                                    let clipped = bounds.intersect(&window.content_mask().bounds);
+                                    let x = (f32::from(bounds.origin.x) * scale).round() as i32;
+                                    let y = (f32::from(bounds.origin.y) * scale).round() as i32;
+                                    let w = (f32::from(bounds.size.width) * scale).round() as i32;
+                                    let h = (f32::from(bounds.size.height) * scale).round() as i32;
+                                    let visible =
+                                        clipped.size.width > px(1.) && clipped.size.height > px(1.) && w > 1 && h > 1;
+                                    vh.sync(parent_hwnd, x, y, w, h, visible);
+                                    if visible {
+                                        window.paint_quad(quad(
+                                            bounds,
+                                            hole_corners,
+                                            super::video_host::VIDEO_HOLE_COLOR,
+                                            Edges::default(),
+                                            transparent_black(),
+                                            BorderStyle::default(),
+                                        ));
+                                    }
+                                }
+                            }
+                        } else {
+                            if native_video && owns_native_host {
+                                if let Some(vh) = &video_host {
+                                    vh.hide();
+                                }
+                            }
+                            // the frame, cropped / zoomed for the aspect mode; what falls
+                            // outside the player is clipped by paint_image
+                            if let Some(f) = picture {
+                                let dims = f.size(0);
+                                let fsize = (i32::from(dims.width) as f32, i32::from(dims.height) as f32);
+                                let (region, fit) = aspect::resolve(aspect, fsize, (vsize.0 as f32, vsize.1 as f32), auto_trim);
+                                let (x, y, w, h) = aspect::layout((f32::from(bounds.size.width), f32::from(bounds.size.height)), fsize, region, fit);
+                                let image = Bounds::new(bounds.origin + point(px(x), px(y)), size(px(w), px(h)));
+                                let _ = window.paint_image(bounds, image, Corners::default(), f, 0, false);
+                            }
                         }
                         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
