@@ -175,7 +175,7 @@ impl Player {
             if let Some(parent) = self.host_parent {
                 match super::video_host::VideoHost::new(parent) {
                     Ok(vh) => self.video_host = Some(Arc::new(vh)),
-                    Err(e) => log::warn!("failed to create native video host: {e}"),
+                    Err(e) => eprintln!("failed to create native video host: {e}"),
                 }
             }
         }

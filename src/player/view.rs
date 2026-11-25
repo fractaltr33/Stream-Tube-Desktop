@@ -216,13 +216,14 @@ impl Render for PlayerView {
         let ui = *cx.global::<UiState>();
         let scale = window.scale_factor();
         let view = cx.entity().downgrade();
-        let aspect = aspect::Mode::parse(&store::settings_snapshot().aspect_mode);
+        let settings = store::settings_snapshot();
+        let aspect = aspect::Mode::parse(&settings.aspect_mode);
         let auto_trim = pl.auto_crop.trim;
         let picture = frame.clone().filter(|_| !audio_only);
         let pip_open = crate::ui::pip::handle(cx).is_some();
         let owns_native_host = !pip_open || self.pip;
         let show_native_video = native_video && !audio_only && error.is_none() && video.is_some() && owns_native_host;
-        let hole_corners = if self.pip || ui.fullscreen || ui.theater {
+        let hole_corners = if self.pip || ui.fullscreen || (!mini && settings.theater_mode) {
             Corners::default()
         } else if mini {
             Corners {
