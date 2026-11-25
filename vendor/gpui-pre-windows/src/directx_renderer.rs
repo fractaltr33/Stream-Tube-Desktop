@@ -2129,7 +2129,8 @@ mod dxgi {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Quad, VIDEO_HOLE_SENTINEL, is_video_hole_quad};
+    use gpui::{black, linear_color_stop, linear_gradient};
 
     #[test]
     fn video_hole_sentinel_matches_only_sentinel_quads() {
